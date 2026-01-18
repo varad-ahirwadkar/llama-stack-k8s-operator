@@ -30,3 +30,12 @@ package controllers
 
 // NetworkPolicy permissions - controller creates and manages network policies
 //+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+
+// Ingress permissions - controller creates and manages ingresses for external access
+//+kubebuilder:rbac:groups=networking.k8s.io,resources=ingresses,verbs=get;list;watch;create;update;patch;delete
+
+// PodDisruptionBudget permissions - controller creates and manages voluntary disruption controls
+//+kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch;create;update;patch;delete
+
+// HorizontalPodAutoscaler permissions - controller creates and manages HPAs for server pods
+//+kubebuilder:rbac:groups=autoscaling,resources=horizontalpodautoscalers,verbs=get;list;watch;create;update;patch;delete

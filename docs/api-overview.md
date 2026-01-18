@@ -11,6 +11,32 @@ Package v1alpha1 contains API Schema definitions for the  v1alpha1 API group
 - [LlamaStackDistribution](#llamastackdistribution)
 - [LlamaStackDistributionList](#llamastackdistributionlist)
 
+#### AllowedFromSpec
+
+AllowedFromSpec defines namespace-based access controls for NetworkPolicies.
+
+_Appears in:_
+- [NetworkSpec](#networkspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `namespaces` _string array_ | Namespaces is an explicit list of namespace names allowed to access the service.<br />Use "*" to allow all namespaces. |  |  |
+| `labels` _string array_ | Labels is a list of namespace label keys that are allowed to access the service.<br />A namespace matching any of these labels will be granted access (OR semantics).<br />Example: ["myproject/lls-allowed", "team/authorized"] |  |  |
+
+#### AutoscalingSpec
+
+AutoscalingSpec configures HorizontalPodAutoscaler targets.
+
+_Appears in:_
+- [ServerSpec](#serverspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `minReplicas` _integer_ | MinReplicas is the lower bound replica count maintained by the HPA |  |  |
+| `maxReplicas` _integer_ | MaxReplicas is the upper bound replica count maintained by the HPA |  |  |
+| `targetCPUUtilizationPercentage` _integer_ | TargetCPUUtilizationPercentage configures CPU based scaling |  |  |
+| `targetMemoryUtilizationPercentage` _integer_ | TargetMemoryUtilizationPercentage configures memory based scaling |  |  |
+
 #### CABundleConfig
 
 CABundleConfig defines the CA bundle configuration for custom certificates
@@ -124,6 +150,7 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `replicas` _integer_ |  | 1 |  |
 | `server` _[ServerSpec](#serverspec)_ |  |  |  |
+| `network` _[NetworkSpec](#networkspec)_ | Network defines network access controls for the LlamaStack service |  |  |
 
 #### LlamaStackDistributionStatus
 
@@ -140,6 +167,31 @@ _Appears in:_
 | `conditions` _[Condition](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#condition-v1-meta) array_ | Conditions represent the latest available observations of the distribution's current state |  |  |
 | `availableReplicas` _integer_ | AvailableReplicas is the number of available replicas |  |  |
 | `serviceURL` _string_ | ServiceURL is the internal Kubernetes service URL where the distribution is exposed |  |  |
+| `routeURL` _string_ | RouteURL is the external URL where the distribution is exposed (when exposeRoute is true).<br />nil when external access is not configured, empty string when Ingress exists but URL not ready. |  |  |
+
+#### NetworkSpec
+
+NetworkSpec defines network access controls for the LlamaStack service.
+
+_Appears in:_
+- [LlamaStackDistributionSpec](#llamastackdistributionspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `exposeRoute` _boolean_ | ExposeRoute when true, creates an Ingress (or OpenShift Route) for external access.<br />Default is false (internal access only). | false |  |
+| `allowedFrom` _[AllowedFromSpec](#allowedfromspec)_ | AllowedFrom defines which namespaces are allowed to access the LlamaStack service.<br />By default, only the LLSD namespace and the operator namespace are allowed. |  |  |
+
+#### PodDisruptionBudgetSpec
+
+PodDisruptionBudgetSpec defines voluntary disruption controls.
+
+_Appears in:_
+- [ServerSpec](#serverspec)
+
+| Field | Description | Default | Validation |
+| --- | --- | --- | --- |
+| `minAvailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#intorstring-intstr-util)_ | MinAvailable is the minimum number of pods that must remain available |  |  |
+| `maxUnavailable` _[IntOrString](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#intorstring-intstr-util)_ | MaxUnavailable is the maximum number of pods that can be disrupted simultaneously |  |  |
 
 #### PodOverrides
 
@@ -192,7 +244,11 @@ _Appears in:_
 | --- | --- | --- | --- |
 | `distribution` _[DistributionType](#distributiontype)_ |  |  |  |
 | `containerSpec` _[ContainerSpec](#containerspec)_ |  |  |  |
+| `workers` _integer_ | Workers configures the number of uvicorn worker processes to run.<br />When set, the operator will launch llama-stack using uvicorn with the specified worker count.<br />Ref: https://fastapi.tiangolo.com/deployment/server-workers/<br />CPU requests are set to the number of workers when set, otherwise 1 full core |  | Minimum: 1 <br /> |
 | `podOverrides` _[PodOverrides](#podoverrides)_ |  |  |  |
+| `podDisruptionBudget` _[PodDisruptionBudgetSpec](#poddisruptionbudgetspec)_ | PodDisruptionBudget controls voluntary disruption tolerance for the server pods |  |  |
+| `topologySpreadConstraints` _[TopologySpreadConstraint](https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.31/#topologyspreadconstraint-v1-core) array_ | TopologySpreadConstraints defines fine-grained spreading rules |  |  |
+| `autoscaling` _[AutoscalingSpec](#autoscalingspec)_ | Autoscaling configures HorizontalPodAutoscaler for the server pods |  |  |
 | `storage` _[StorageSpec](#storagespec)_ | Storage defines the persistent storage configuration |  |  |
 | `userConfig` _[UserConfigSpec](#userconfigspec)_ | UserConfig defines the user configuration for the llama-stack server |  |  |
 | `tlsConfig` _[TLSConfig](#tlsconfig)_ | TLSConfig defines the TLS configuration for the llama-stack server |  |  |

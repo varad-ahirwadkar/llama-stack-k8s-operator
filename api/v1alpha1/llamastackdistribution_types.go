@@ -25,6 +25,7 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 const (
@@ -44,8 +45,13 @@ const (
 	LlamaStackDistributionKind = "LlamaStackDistribution"
 )
 
-// DefaultStorageSize is the default size for persistent storage
-var DefaultStorageSize = resource.MustParse("10Gi")
+var (
+	// DefaultStorageSize is the default size for persistent storage
+	DefaultStorageSize = resource.MustParse("10Gi")
+	// Default requests ensure the HPA and scheduler have baseline values
+	DefaultServerCPURequest    = resource.MustParse("500m")
+	DefaultServerMemoryRequest = resource.MustParse("1Gi")
+)
 
 // DistributionType defines the distribution configuration for llama-stack.
 // +kubebuilder:validation:XValidation:rule="!(has(self.name) && has(self.image))",message="Only one of name or image can be specified"
@@ -69,13 +75,60 @@ type LlamaStackDistributionSpec struct {
 	// +kubebuilder:default:=1
 	Replicas int32      `json:"replicas,omitempty"`
 	Server   ServerSpec `json:"server"`
+	// Network defines network access controls for the LlamaStack service
+	// +optional
+	Network *NetworkSpec `json:"network,omitempty"`
+}
+
+// NetworkSpec defines network access controls for the LlamaStack service.
+type NetworkSpec struct {
+	// ExposeRoute when true, creates an Ingress (or OpenShift Route) for external access.
+	// Default is false (internal access only).
+	// +optional
+	// +kubebuilder:default:=false
+	ExposeRoute bool `json:"exposeRoute,omitempty"`
+
+	// AllowedFrom defines which namespaces are allowed to access the LlamaStack service.
+	// By default, only the LLSD namespace and the operator namespace are allowed.
+	// +optional
+	AllowedFrom *AllowedFromSpec `json:"allowedFrom,omitempty"`
+}
+
+// AllowedFromSpec defines namespace-based access controls for NetworkPolicies.
+type AllowedFromSpec struct {
+	// Namespaces is an explicit list of namespace names allowed to access the service.
+	// Use "*" to allow all namespaces.
+	// +optional
+	Namespaces []string `json:"namespaces,omitempty"`
+
+	// Labels is a list of namespace label keys that are allowed to access the service.
+	// A namespace matching any of these labels will be granted access (OR semantics).
+	// Example: ["myproject/lls-allowed", "team/authorized"]
+	// +optional
+	Labels []string `json:"labels,omitempty"`
 }
 
 // ServerSpec defines the desired state of llama server.
 type ServerSpec struct {
 	Distribution  DistributionType `json:"distribution"`
 	ContainerSpec ContainerSpec    `json:"containerSpec,omitempty"`
-	PodOverrides  *PodOverrides    `json:"podOverrides,omitempty"` // Optional pod-level overrides
+	// Workers configures the number of uvicorn worker processes to run.
+	// When set, the operator will launch llama-stack using uvicorn with the specified worker count.
+	// Ref: https://fastapi.tiangolo.com/deployment/server-workers/
+	// CPU requests are set to the number of workers when set, otherwise 1 full core
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Workers      *int32        `json:"workers,omitempty"`
+	PodOverrides *PodOverrides `json:"podOverrides,omitempty"` // Optional pod-level overrides
+	// PodDisruptionBudget controls voluntary disruption tolerance for the server pods
+	// +optional
+	PodDisruptionBudget *PodDisruptionBudgetSpec `json:"podDisruptionBudget,omitempty"`
+	// TopologySpreadConstraints defines fine-grained spreading rules
+	// +optional
+	TopologySpreadConstraints []corev1.TopologySpreadConstraint `json:"topologySpreadConstraints,omitempty"`
+	// Autoscaling configures HorizontalPodAutoscaler for the server pods
+	// +optional
+	Autoscaling *AutoscalingSpec `json:"autoscaling,omitempty"`
 	// Storage defines the persistent storage configuration
 	// +optional
 	Storage *StorageSpec `json:"storage,omitempty"`
@@ -148,6 +201,31 @@ type PodOverrides struct {
 	VolumeMounts       []corev1.VolumeMount `json:"volumeMounts,omitempty"`
 }
 
+// PodDisruptionBudgetSpec defines voluntary disruption controls.
+type PodDisruptionBudgetSpec struct {
+	// MinAvailable is the minimum number of pods that must remain available
+	// +optional
+	MinAvailable *intstr.IntOrString `json:"minAvailable,omitempty"`
+	// MaxUnavailable is the maximum number of pods that can be disrupted simultaneously
+	// +optional
+	MaxUnavailable *intstr.IntOrString `json:"maxUnavailable,omitempty"`
+}
+
+// AutoscalingSpec configures HorizontalPodAutoscaler targets.
+type AutoscalingSpec struct {
+	// MinReplicas is the lower bound replica count maintained by the HPA
+	// +optional
+	MinReplicas *int32 `json:"minReplicas,omitempty"`
+	// MaxReplicas is the upper bound replica count maintained by the HPA
+	MaxReplicas int32 `json:"maxReplicas"`
+	// TargetCPUUtilizationPercentage configures CPU based scaling
+	// +optional
+	TargetCPUUtilizationPercentage *int32 `json:"targetCPUUtilizationPercentage,omitempty"`
+	// TargetMemoryUtilizationPercentage configures memory based scaling
+	// +optional
+	TargetMemoryUtilizationPercentage *int32 `json:"targetMemoryUtilizationPercentage,omitempty"`
+}
+
 // ProviderInfo represents a single provider from the providers endpoint.
 type ProviderInfo struct {
 	API          string               `json:"api"`
@@ -207,6 +285,10 @@ type LlamaStackDistributionStatus struct {
 	AvailableReplicas int32 `json:"availableReplicas,omitempty"`
 	// ServiceURL is the internal Kubernetes service URL where the distribution is exposed
 	ServiceURL string `json:"serviceURL,omitempty"`
+	// RouteURL is the external URL where the distribution is exposed (when exposeRoute is true).
+	// nil when external access is not configured, empty string when Ingress exists but URL not ready.
+	// +optional
+	RouteURL *string `json:"routeURL,omitempty"`
 }
 
 //+kubebuilder:object:root=true

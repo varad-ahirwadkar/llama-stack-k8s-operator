@@ -7,16 +7,20 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"sort"
 
 	llamav1alpha1 "github.com/llamastack/llama-stack-k8s-operator/api/v1alpha1"
 	"github.com/llamastack/llama-stack-k8s-operator/pkg/compare"
 	"github.com/llamastack/llama-stack-k8s-operator/pkg/deploy/plugins"
+	autoscalingv2 "k8s.io/api/autoscaling/v2"
+	policyv1 "k8s.io/api/policy/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	k8stypes "k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/apimachinery/pkg/util/yaml"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -27,6 +31,8 @@ import (
 	"sigs.k8s.io/kustomize/kyaml/filesys"
 	yamlpkg "sigs.k8s.io/yaml"
 )
+
+const deploymentKind = "Deployment"
 
 // RenderManifest takes a manifest directory and transforms it through
 // kustomization and plugins to produce final Kubernetes resources.
@@ -164,7 +170,7 @@ func patchResource(ctx context.Context, cli client.Client, desired, existing *un
 		}
 	}
 	if !isOwner {
-		logger.Info("Skipping resource not owned by this instance",
+		logger.V(1).Info("Skipping resource not owned by this instance",
 			"kind", existing.GetKind(),
 			"name", existing.GetName(),
 			"namespace", existing.GetNamespace())
@@ -172,7 +178,7 @@ func patchResource(ctx context.Context, cli client.Client, desired, existing *un
 	}
 
 	if existing.GetKind() == "PersistentVolumeClaim" {
-		logger.Info("Skipping PVC patch - PVCs are immutable after creation",
+		logger.V(1).Info("Skipping PVC patch - PVCs are immutable after creation",
 			"name", existing.GetName(),
 			"namespace", existing.GetNamespace())
 		return nil
@@ -201,7 +207,7 @@ func applyPlugins(resMap *resmap.ResMap, ownerInstance *llamav1alpha1.LlamaStack
 	namePrefixPlugin := plugins.CreateNamePrefixPlugin(plugins.NamePrefixConfig{
 		Prefix: ownerInstance.GetName(),
 		// Exclude Deployment to maintain backward compatibility with existing deployment names
-		ExcludeKinds: []string{"Deployment"},
+		ExcludeKinds: []string{deploymentKind},
 	})
 	if err := namePrefixPlugin.Transform(*resMap); err != nil {
 		return fmt.Errorf("failed to apply name prefix: %w", err)
@@ -222,6 +228,66 @@ func applyPlugins(resMap *resmap.ResMap, ownerInstance *llamav1alpha1.LlamaStack
 		return fmt.Errorf("failed to apply field transformer: %w", err)
 	}
 
+	// Apply NetworkPolicy transformer to configure ingress rules based on spec.network
+	if err := applyNetworkPolicyTransformer(resMap, ownerInstance); err != nil {
+		return fmt.Errorf("failed to apply NetworkPolicy transformer: %w", err)
+	}
+
+	if isAutoscalingEnabled(ownerInstance) {
+		if err := removeDeploymentReplicas(*resMap); err != nil {
+			return fmt.Errorf("failed to strip replicas for autoscaling: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// applyNetworkPolicyTransformer applies the NetworkPolicy transformer plugin.
+func applyNetworkPolicyTransformer(resMap *resmap.ResMap, ownerInstance *llamav1alpha1.LlamaStackDistribution) error {
+	operatorNS, err := GetOperatorNamespace()
+	if err != nil {
+		operatorNS = "llama-stack-k8s-operator-system"
+	}
+
+	npTransformer := plugins.CreateNetworkPolicyTransformer(plugins.NetworkPolicyTransformerConfig{
+		InstanceName:      ownerInstance.GetName(),
+		ServicePort:       GetServicePort(ownerInstance),
+		OperatorNamespace: operatorNS,
+		NetworkSpec:       ownerInstance.Spec.Network,
+	})
+
+	return npTransformer.Transform(*resMap)
+}
+
+// removeDeploymentReplicas deletes spec.replicas from Deployment manifests so that
+// the HPA (or default Kubernetes behavior) controls the replica count.
+func removeDeploymentReplicas(resMap resmap.ResMap) error {
+	for _, res := range resMap.Resources() {
+		if res.GetKind() != deploymentKind {
+			continue
+		}
+
+		data, err := parseResourceYAML(res)
+		if err != nil {
+			return err
+		}
+
+		spec, ok := data["spec"].(map[string]any)
+		if !ok {
+			continue
+		}
+
+		if _, exists := spec["replicas"]; !exists {
+			continue
+		}
+
+		delete(spec, "replicas")
+
+		if err := updateResourceFromData(res, data); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -232,15 +298,15 @@ func getFieldMappings(ownerInstance *llamav1alpha1.LlamaStackDistribution) []plu
 	serviceAccountName := instanceName + "-sa"
 	servicePort := getServicePort(ownerInstance)
 	storageSize := getStorageSize(ownerInstance)
-	operatorNS := getOperatorNamespace()
 	instanceLabelPath := "/app.kubernetes.io~1instance"
 
-	return buildFieldMappings(instanceName, instanceNamespace, serviceAccountName, servicePort, storageSize, operatorNS, instanceLabelPath, ownerInstance.Spec.Replicas)
+	return buildFieldMappings(instanceName, instanceNamespace, serviceAccountName, servicePort, storageSize, instanceLabelPath, ownerInstance.Spec.Replicas)
 }
 
 // buildFieldMappings constructs the field mappings array.
 func buildFieldMappings(instanceName, instanceNamespace, serviceAccountName string,
-	servicePort any, storageSize, operatorNS, instanceLabelPath string, replicas int32) []plugins.FieldMapping {
+	servicePort any, storageSize, instanceLabelPath string, replicas int32) []plugins.FieldMapping {
+	var replicaSourceValue any = replicas
 	return []plugins.FieldMapping{
 		{
 			SourceValue:       storageSize,
@@ -276,7 +342,7 @@ func buildFieldMappings(instanceName, instanceNamespace, serviceAccountName stri
 			CreateIfNotExists: true,
 		},
 		{
-			SourceValue:       replicas,
+			SourceValue:       replicaSourceValue,
 			TargetField:       "/spec/replicas",
 			TargetKind:        "Deployment",
 			CreateIfNotExists: true,
@@ -313,29 +379,14 @@ func buildFieldMappings(instanceName, instanceNamespace, serviceAccountName stri
 		},
 		{
 			SourceValue:       instanceName,
-			TargetField:       "/spec/podSelector/matchLabels" + instanceLabelPath,
-			TargetKind:        "NetworkPolicy",
+			TargetField:       "/spec/selector/matchLabels" + instanceLabelPath,
+			TargetKind:        "PodDisruptionBudget",
 			CreateIfNotExists: true,
 		},
 		{
-			SourceValue:       servicePort,
-			DefaultValue:      llamav1alpha1.DefaultServerPort,
-			TargetField:       "/spec/ingress/0/ports/0/port",
-			TargetKind:        "NetworkPolicy",
-			CreateIfNotExists: true,
-		},
-		{
-			SourceValue:       servicePort,
-			DefaultValue:      llamav1alpha1.DefaultServerPort,
-			TargetField:       "/spec/ingress/1/ports/0/port",
-			TargetKind:        "NetworkPolicy",
-			CreateIfNotExists: true,
-		},
-		{
-			SourceValue:       operatorNS,
-			DefaultValue:      "llama-stack-k8s-operator-system",
-			TargetField:       "/spec/ingress/1/from/0/namespaceSelector/matchLabels/kubernetes.io~1metadata.name",
-			TargetKind:        "NetworkPolicy",
+			SourceValue:       instanceName,
+			TargetField:       "/spec/scaleTargetRef/name",
+			TargetKind:        "HorizontalPodAutoscaler",
 			CreateIfNotExists: true,
 		},
 	}
@@ -359,22 +410,23 @@ func getServicePort(instance *llamav1alpha1.LlamaStackDistribution) any {
 	return nil
 }
 
-// getOperatorNamespace returns the operator namespace or empty string if not available.
-func getOperatorNamespace() string {
-	if ns, err := GetOperatorNamespace(); err == nil {
-		return ns
+func isAutoscalingEnabled(instance *llamav1alpha1.LlamaStackDistribution) bool {
+	if instance == nil || instance.Spec.Server.Autoscaling == nil {
+		return false
 	}
-	// Returning empty string signals the field transformer to use the default value.
-	return ""
+
+	return instance.Spec.Server.Autoscaling.MaxReplicas > 0
 }
 
 // ManifestContext provides the necessary context for complex resource rendering.
 type ManifestContext struct {
-	ResolvedImage string
-	ConfigMapHash string
-	CABundleHash  string
-	ContainerSpec map[string]any
-	PodSpec       map[string]any
+	ResolvedImage           string
+	ConfigMapHash           string
+	CABundleHash            string
+	ContainerSpec           map[string]any
+	PodSpec                 map[string]any
+	PodDisruptionBudgetSpec *policyv1.PodDisruptionBudgetSpec
+	HPASpec                 *autoscalingv2.HorizontalPodAutoscalerSpec
 }
 
 // RenderManifestWithContext renders manifests and enhances the Deployment with complex specs.
@@ -395,14 +447,21 @@ func RenderManifestWithContext(
 		return resMap, nil
 	}
 
-	// Update the Deployment with the manifest context
+	// Update the resources with the manifest context
 	for _, res := range (*resMap).Resources() {
-		if res.GetKind() != "Deployment" {
-			continue
-		}
-
-		if err := updateDeploymentSpec(res, manifestCtx); err != nil {
-			return nil, fmt.Errorf("failed to update Deployment: %w", err)
+		switch res.GetKind() {
+		case deploymentKind:
+			if err := updateDeploymentSpec(res, manifestCtx); err != nil {
+				return nil, fmt.Errorf("failed to update Deployment: %w", err)
+			}
+		case "PodDisruptionBudget":
+			if err := updatePodDisruptionBudget(res, manifestCtx); err != nil {
+				return nil, fmt.Errorf("failed to update PodDisruptionBudget: %w", err)
+			}
+		case "HorizontalPodAutoscaler":
+			if err := updateHorizontalPodAutoscaler(res, manifestCtx); err != nil {
+				return nil, fmt.Errorf("failed to update HorizontalPodAutoscaler: %w", err)
+			}
 		}
 	}
 
@@ -412,7 +471,7 @@ func RenderManifestWithContext(
 // updateDeploymentSpec updates the Deployment spec with the manifest context.
 func updateDeploymentSpec(res *resource.Resource, manifestCtx *ManifestContext) error {
 	// Parse the deployment YAML
-	data, err := parseDeploymentYAML(res)
+	data, err := parseResourceYAML(res)
 	if err != nil {
 		return err
 	}
@@ -424,9 +483,16 @@ func updateDeploymentSpec(res *resource.Resource, manifestCtx *ManifestContext) 
 	}
 
 	// Apply pod spec enhancements
+	// Sort keys to ensure deterministic ordering and prevent spurious deployment updates
 	if manifestCtx.PodSpec != nil {
-		for key, value := range manifestCtx.PodSpec {
-			templateSpec[key] = value
+		keys := make([]string, 0, len(manifestCtx.PodSpec))
+		for key := range manifestCtx.PodSpec {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		for _, key := range keys {
+			templateSpec[key] = manifestCtx.PodSpec[key]
 		}
 	}
 
@@ -439,8 +505,8 @@ func updateDeploymentSpec(res *resource.Resource, manifestCtx *ManifestContext) 
 	return updateResourceFromData(res, data)
 }
 
-// parseDeploymentYAML parses the deployment resource YAML into a map.
-func parseDeploymentYAML(res *resource.Resource) (map[string]any, error) {
+// parseResourceYAML parses a resource YAML into a map.
+func parseResourceYAML(res *resource.Resource) (map[string]any, error) {
 	yamlBytes, err := res.AsYAML()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get YAML: %w", err)
@@ -506,6 +572,59 @@ func addConfigMapAnnotations(data map[string]any, manifestCtx *ManifestContext) 
 	}
 
 	return nil
+}
+
+func updatePodDisruptionBudget(res *resource.Resource, manifestCtx *ManifestContext) error {
+	if manifestCtx.PodDisruptionBudgetSpec == nil {
+		return nil
+	}
+	data, err := parseResourceYAML(res)
+	if err != nil {
+		return err
+	}
+	spec, ok := data["spec"].(map[string]any)
+	if !ok {
+		return errors.New("failed to find PDB spec in data")
+	}
+
+	if manifestCtx.PodDisruptionBudgetSpec.MinAvailable != nil {
+		spec["minAvailable"] = intOrStringToInterface(manifestCtx.PodDisruptionBudgetSpec.MinAvailable)
+	} else {
+		delete(spec, "minAvailable")
+	}
+	if manifestCtx.PodDisruptionBudgetSpec.MaxUnavailable != nil {
+		spec["maxUnavailable"] = intOrStringToInterface(manifestCtx.PodDisruptionBudgetSpec.MaxUnavailable)
+	} else {
+		delete(spec, "maxUnavailable")
+	}
+
+	return updateResourceFromData(res, data)
+}
+
+func updateHorizontalPodAutoscaler(res *resource.Resource, manifestCtx *ManifestContext) error {
+	if manifestCtx.HPASpec == nil {
+		return nil
+	}
+	specMap, err := runtime.DefaultUnstructuredConverter.ToUnstructured(manifestCtx.HPASpec)
+	if err != nil {
+		return fmt.Errorf("failed to convert HPA spec: %w", err)
+	}
+	data, err := parseResourceYAML(res)
+	if err != nil {
+		return err
+	}
+	data["spec"] = specMap
+	return updateResourceFromData(res, data)
+}
+
+func intOrStringToInterface(value *intstr.IntOrString) any {
+	if value == nil {
+		return nil
+	}
+	if value.Type == intstr.String {
+		return value.StrVal
+	}
+	return value.IntValue()
 }
 
 // updateResourceFromData updates the resource with the modified data.
